@@ -2,6 +2,7 @@
 
 import json
 import time
+import asyncio
 from typing import Dict, Any, List, Optional
 
 import tiktoken
@@ -12,6 +13,8 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from app.client.copilot import CopilotClient
 from app.config.settings import get_settings
 from app.utils.logger import logger
+from app.utils.token import get_token_config_async, schedule_token_refresh
+from app.utils.redis_manager import RedisManager
 
 # Create FastAPI application
 settings = get_settings()
@@ -21,10 +24,13 @@ app = FastAPI(
     version=settings.api_version,
 )
 
+# Initialize Redis manager
+redis_manager = RedisManager()
+
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.allow_origins,  # Using the property now
+    allow_origins=settings.allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -32,6 +38,42 @@ app.add_middleware(
 
 # Create tiktoken encoder for token counting
 encoding = tiktoken.encoding_for_model("gpt-4")
+
+# Background task for token refresh
+token_refresh_task = None
+
+@app.on_event("startup")
+async def startup_event():
+    """Execute startup tasks."""
+    # Log Redis connection status
+    if redis_manager.is_connected():
+        logger.info("Redis connection established, using Redis for token storage")
+    else:
+        logger.warning("Redis connection failed, using memory storage only")
+    
+    # Initialize token on startup
+    token_config = await get_token_config_async()
+    if token_config:
+        logger.info(f"Initial token loaded, expires at: {token_config.get('expires_at', 0)}")
+    else:
+        logger.warning("Failed to load initial token")
+    
+    # Start background token refresh task
+    global token_refresh_task
+    token_refresh_task = asyncio.create_task(schedule_token_refresh())
+    logger.info("Token refresh background task started")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Execute shutdown tasks."""
+    # Cancel token refresh background task
+    global token_refresh_task
+    if token_refresh_task:
+        token_refresh_task.cancel()
+        try:
+            await token_refresh_task
+        except asyncio.CancelledError:
+            logger.info("Token refresh task cancelled")
 
 # Utility functions
 def generate_chat_id() -> str:
@@ -82,10 +124,22 @@ def verify_token():
 async def root():
     """Root endpoint."""
     token_status = "configured" if settings.github_copilot_token else "not configured"
+    redis_status = "connected" if redis_manager.is_connected() else "disconnected"
+    
+    # Get token expiration info if available
+    token_info = ""
+    if settings.copilot_config:
+        expires_at = settings.copilot_config.get("expires_at", 0)
+        current_time = int(time.time())
+        if expires_at > current_time:
+            token_info = f", expires in {expires_at - current_time} seconds"
+    
     return {
         "message": "Welcome to CopilotAPI", 
         "version": settings.api_version,
-        "github_token_status": token_status
+        "github_token_status": token_status + token_info,
+        "redis_status": redis_status,
+        "storage_type": "Redis" if redis_manager.is_connected() else "Memory"
     }
 
 @app.get("/v1/models")
@@ -108,6 +162,26 @@ async def list_models():
             },
         ],
     }
+
+@app.get("/v1/token/refresh")
+async def refresh_token():
+    """
+    Manually refresh the token.
+    Useful for testing token refresh functionality.
+    """
+    from app.utils.token import fetch_copilot_token
+    
+    token = await fetch_copilot_token()
+    if token:
+        expires_at = token.get("expires_at", 0)
+        current_time = int(time.time())
+        return {
+            "status": "success",
+            "expires_in": expires_at - current_time,
+            "storage": "Redis" if redis_manager.is_connected() else "Memory"
+        }
+    else:
+        raise HTTPException(status_code=500, detail="Failed to refresh token")
 
 @app.post("/v1/chat/completions", dependencies=[Depends(verify_token)])
 async def chat_completions(request: Request):
