@@ -97,7 +97,8 @@ class CopilotClient:
                     error_text = await response.text()
                     raise ClientError(f"HTTP error {response.status}: {error_text}")
                 
-                async for chunk in response.content.iter_chunked(1024):
+                # Use larger chunk size to reduce the chance of splitting JSON or XML structures
+                async for chunk in response.content.iter_chunked(4096):
                     if chunk:
                         yield chunk
     

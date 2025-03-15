@@ -10,7 +10,7 @@ from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from app.client.copilot import CopilotClient
+from app.client.enhanced_copilot import EnhancedCopilotClient as CopilotClient
 from app.config.settings import get_settings
 from app.utils.logger import logger
 from app.utils.token import get_token_config_async, schedule_token_refresh
@@ -259,11 +259,15 @@ async def stream_response(
     presence_penalty: float,
     frequency_penalty: float
 ) -> StreamingResponse:
-    """Generate a streaming response."""
+    """Generate a streaming response with enhanced MCP tool support."""
     
     async def stream_generator():
         chat_id = generate_chat_id()
         created_time = int(time.time())
+        
+        # Keep track of MCP tool responses for potential later use
+        mcp_tool_response_pending = False
+        mcp_tool_content = ""
         
         try:
             async for event_type, event_data in client.generate_chat_completion(
@@ -276,15 +280,34 @@ async def stream_response(
                 stream=True
             ):
                 if event_type == "content":
+                    # If we had a pending MCP tool response, send it first
+                    if mcp_tool_response_pending:
+                        yield create_response_chunk(chat_id, created_time, model, content=f"\n\n{mcp_tool_content}\n\n")
+                        mcp_tool_response_pending = False
+                        mcp_tool_content = ""
+                    
+                    # Send the regular content
                     content = event_data.get("content", "")
                     yield create_response_chunk(chat_id, created_time, model, content=content)
+                
+                elif event_type == "mcp_tool":
+                    # Save MCP tool content for later delivery
+                    mcp_tool_content = event_data.get("content", "")
+                    mcp_tool_response_pending = True
+                    logger.debug(f"MCP tool response received, length: {len(mcp_tool_content)}")
+                
                 elif event_type == "error":
                     logger.error(f"Error in stream: {event_data.get('error', '')}")
                     yield create_response_chunk(chat_id, created_time, model, content="Error occurred during generation")
                     yield create_response_chunk(chat_id, created_time, model, finish_reason="error")
                     yield b"data: [DONE]\n\n"
                     return
+                
                 elif event_type == "done":
+                    # If we have a pending MCP tool response, send it before finishing
+                    if mcp_tool_response_pending:
+                        yield create_response_chunk(chat_id, created_time, model, content=f"\n\n{mcp_tool_content}\n\n")
+                    
                     yield create_response_chunk(chat_id, created_time, model, finish_reason="stop")
                     yield b"data: [DONE]\n\n"
                     return
@@ -305,7 +328,7 @@ async def non_stream_response(
     presence_penalty: float,
     frequency_penalty: float
 ) -> Dict[str, Any]:
-    """Generate a non-streaming response."""
+    """Generate a non-streaming response with MCP tool support."""
     
     chat_id = generate_chat_id()
     created_time = int(time.time())
@@ -315,17 +338,35 @@ async def non_stream_response(
         input_text = "\n".join(msg.get("content", "") for msg in messages)
         input_tokens = encoding.encode(input_text)
         
-        # Get complete response
-        result = await client.complete_chat_without_streaming(
+        # Collect responses through the streaming interface to handle MCP tool responses properly
+        content_parts = []
+        mcp_tool_parts = []
+        
+        async for event_type, event_data in client.generate_chat_completion(
             messages=messages,
             model=model,
             temperature=temperature,
             top_p=top_p,
             presence_penalty=presence_penalty,
-            frequency_penalty=frequency_penalty
-        )
+            frequency_penalty=frequency_penalty,
+            stream=True  # We still use streaming internally for consistent processing
+        ):
+            if event_type == "content":
+                content_parts.append(event_data.get("content", ""))
+            elif event_type == "mcp_tool":
+                mcp_tool_parts.append(event_data.get("content", ""))
+            elif event_type == "error":
+                logger.error(f"Error in non-streaming response: {event_data.get('error', '')}")
+                raise HTTPException(status_code=500, detail=event_data.get('error', 'Unknown error'))
         
-        content = result.get("content", "")
+        # Combine all content
+        content = "".join(content_parts)
+        
+        # If there are MCP tool responses, add them
+        if mcp_tool_parts:
+            if content and not content.endswith("\n"):
+                content += "\n\n"
+            content += "\n\n".join(mcp_tool_parts)
         
         # Calculate completion tokens
         output_tokens = encoding.encode(content)
